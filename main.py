@@ -53,7 +53,7 @@ DELEGATION_CHANNEL_ID = os.environ["DELEGATION_CHANNEL_ID"]
 
 # Vercel servers run in UTC. Voice notes say things like "kal"/"tomorrow",
 # so resolve the reference date in YOUR timezone, not the server's.
-LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE", "Asia/Karachi")
+LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE", "Asia/Kolkata")
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
