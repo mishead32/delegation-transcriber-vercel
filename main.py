@@ -35,6 +35,7 @@ from flask import Flask, request
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.service_account import Credentials
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -89,6 +90,13 @@ GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Delegation Log")
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
+# Google Drive folder where audio files are archived. Create a folder in your
+# Drive, share it with the service account's client_email as Editor, and put
+# its ID here (the part of the folder URL after /folders/). If this env var is
+# not set, the Drive upload is skipped and the sheet's link column stays empty
+# -- the transcription pipeline is never affected.
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
+
 AUDIO_SUBTYPES = {"audio", "m4a", "mp3", "mp4", "wav", "ogg", "webm", "aac"}
 MIME_OVERRIDES = {
     ".m4a": "audio/mp4",
@@ -102,6 +110,7 @@ MIME_OVERRIDES = {
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 
 # ---------------------------------------------------------------------------
@@ -152,6 +161,75 @@ def get_sheet():
         ])
         _sheet = ws
     return _sheet
+
+
+# ---------------------------------------------------------------------------
+# Google Drive helper (fail-soft: any problem here returns "" and the main
+# transcription pipeline continues untouched)
+# ---------------------------------------------------------------------------
+def upload_audio_to_drive(local_path, original_name, message_dt):
+    """Uploads the audio to the shared Drive folder, makes it link-viewable,
+    and returns the webViewLink. Returns "" on any failure or if not configured.
+
+    Uses the Drive v3 REST API directly with the existing service-account
+    credentials, so no new pip dependencies are needed.
+    """
+    if not GDRIVE_FOLDER_ID:
+        logger.info("upload_audio_to_drive: GDRIVE_FOLDER_ID not set, skipping upload.")
+        return ""
+    try:
+        # Refresh the service-account token (shared with the Sheets client).
+        if not google_creds.valid:
+            google_creds.refresh(GoogleAuthRequest())
+        token = google_creds.token
+
+        safe_name = original_name or "voice_note.m4a"
+        drive_name = message_dt.strftime("%Y-%m-%d_%H-%M-%S") + "_" + safe_name
+        ext = os.path.splitext(safe_name)[1].lower()
+        mime_type = MIME_OVERRIDES.get(ext, "audio/mp4")
+
+        metadata = {"name": drive_name, "parents": [GDRIVE_FOLDER_ID]}
+        with open(local_path, "rb") as fh:
+            audio_bytes = fh.read()
+
+        resp = requests.post(
+            "https://www.googleapis.com/upload/drive/v3/files"
+            "?uploadType=multipart&fields=id,webViewLink&supportsAllDrives=true",
+            headers={"Authorization": "Bearer " + token},
+            files={
+                "metadata": ("metadata", json.dumps(metadata), "application/json; charset=UTF-8"),
+                "file": (drive_name, audio_bytes, mime_type),
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        info = resp.json()
+        file_id = info["id"]
+        link = info.get("webViewLink") or ("https://drive.google.com/file/d/" + file_id + "/view")
+        logger.info("upload_audio_to_drive: uploaded %s as file id %s", drive_name, file_id)
+
+        # Make the file viewable by anyone with the link, so the sheet link
+        # works for everyone. If this step fails we still return the link
+        # (folder-level sharing may already cover the viewers).
+        try:
+            perm_resp = requests.post(
+                "https://www.googleapis.com/drive/v3/files/" + file_id
+                + "/permissions?supportsAllDrives=true",
+                headers={
+                    "Authorization": "Bearer " + token,
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps({"role": "reader", "type": "anyone"}),
+                timeout=30,
+            )
+            perm_resp.raise_for_status()
+        except Exception as e:
+            logger.warning("upload_audio_to_drive: could not set link-sharing permission: %s", repr(e))
+
+        return link
+    except Exception as e:
+        logger.warning("upload_audio_to_drive: upload failed (continuing without link): %s", repr(e))
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +431,9 @@ def handle_message_events(event, say, logger):
                 permalink = get_permalink(event["channel"], event["ts"])
                 timestamp = message_dt.strftime("%Y-%m-%d %H:%M:%S")
 
+                # Archive the audio in Google Drive (fail-soft: "" on any error).
+                audio_link = upload_audio_to_drive(local_path, f.get("name"), message_dt)
+
                 get_sheet().append_row([
                     timestamp,
                     user_name,
@@ -363,6 +444,7 @@ def handle_message_events(event, say, logger):
                     result["task"],
                     result["doers"],
                     result["planned_date_time"],
+                    audio_link,
                 ])
                 logger.info("Logged transcript + task info from %s to Google Sheet.", user_name)
 
