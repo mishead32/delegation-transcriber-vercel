@@ -126,9 +126,30 @@ sheet = get_sheet()
 # ---------------------------------------------------------------------------
 def download_slack_file(file_info):
     url = file_info["url_private_download"]
-    headers = {"Authorization": "Bearer " + SLACK_BOT_TOKEN}
-    resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
+    headers = {
+        "Authorization": "Bearer " + SLACK_BOT_TOKEN,
+        "User-Agent": "Mozilla/5.0 (compatible; DelegationTranscriber/1.0)",
+    }
+
+    max_attempts = 4
+    attempt = 1
+    resp = None
+    while attempt <= max_attempts:
+        try:
+            resp = requests.get(url, headers=headers, timeout=60)
+            resp.raise_for_status()
+            break
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+            if attempt == max_attempts:
+                raise
+            wait = 3 * attempt
+            logger.warning(
+                "Slack file download failed (attempt %s/%s), retrying in %ss: %s",
+                attempt, max_attempts, wait, e,
+            )
+            time.sleep(wait)
+            attempt = attempt + 1
+
     suffix = os.path.splitext(file_info.get("name", "audio.m4a"))[1].lower() or ".m4a"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(resp.content)
