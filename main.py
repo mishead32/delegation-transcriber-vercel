@@ -15,6 +15,8 @@ import json
 import logging
 import tempfile
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 
 import requests
@@ -31,8 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("delegation-transcriber")
 
 # ---------------------------------------------------------------------------
-# Config (all pulled from environment variables -- set these in Vercel's
-# Project Settings > Environment Variables)
+# Config
 # ---------------------------------------------------------------------------
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
@@ -126,35 +127,62 @@ sheet = get_sheet()
 # ---------------------------------------------------------------------------
 def download_slack_file(file_info):
     url = file_info["url_private_download"]
-    headers = {
-        "Authorization": "Bearer " + SLACK_BOT_TOKEN,
-        "User-Agent": "Mozilla/5.0 (compatible; DelegationTranscriber/1.0)",
-    }
-
-    max_attempts = 4
-    attempt = 1
-    resp = None
-    while attempt <= max_attempts:
-        try:
-            resp = requests.get(url, headers=headers, timeout=60)
-            resp.raise_for_status()
-            break
-        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
-            if attempt == max_attempts:
-                raise
-            wait = 3 * attempt
-            logger.warning(
-                "Slack file download failed (attempt %s/%s), retrying in %ss: %s",
-                attempt, max_attempts, wait, e,
-            )
-            time.sleep(wait)
-            attempt = attempt + 1
+    logger.info("download_slack_file: starting, url=%s", url)
 
     suffix = os.path.splitext(file_info.get("name", "audio.m4a"))[1].lower() or ".m4a"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(resp.content)
-    tmp.close()
-    return tmp.name
+    max_attempts = 4
+    attempt = 1
+    last_error = None
+
+    while attempt <= max_attempts:
+        logger.info("download_slack_file: attempt %s/%s (urllib)", attempt, max_attempts)
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": "Bearer " + SLACK_BOT_TOKEN,
+                    "User-Agent": "Mozilla/5.0 (compatible; DelegationTranscriber/1.0)",
+                },
+            )
+            response = urllib.request.urlopen(req, timeout=60)
+            data = response.read()
+            response.close()
+            logger.info("download_slack_file: urllib succeeded, %s bytes", len(data))
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(data)
+            tmp.close()
+            return tmp.name
+        except Exception as e:
+            last_error = e
+            logger.warning("download_slack_file: urllib attempt %s failed: %s", attempt, repr(e))
+
+        try:
+            logger.info("download_slack_file: attempt %s/%s (requests fallback)", attempt, max_attempts)
+            resp = requests.get(
+                url,
+                headers={
+                    "Authorization": "Bearer " + SLACK_BOT_TOKEN,
+                    "User-Agent": "Mozilla/5.0 (compatible; DelegationTranscriber/1.0)",
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            logger.info("download_slack_file: requests succeeded, %s bytes", len(resp.content))
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(resp.content)
+            tmp.close()
+            return tmp.name
+        except Exception as e:
+            last_error = e
+            logger.warning("download_slack_file: requests attempt %s failed: %s", attempt, repr(e))
+
+        if attempt == max_attempts:
+            logger.error("download_slack_file: all %s attempts failed", max_attempts)
+            raise last_error
+
+        wait = 3 * attempt
+        time.sleep(wait)
+        attempt = attempt + 1
 
 
 def analyze_audio(local_path, reference_dt):
@@ -231,8 +259,7 @@ def get_permalink(channel, ts):
 
 
 # ---------------------------------------------------------------------------
-# Bolt-level error handler -- catches exceptions Bolt intercepts before/after
-# dispatching to our listener, so nothing fails completely silently.
+# Bolt-level error handler
 # ---------------------------------------------------------------------------
 @slack_app.error
 def handle_bolt_errors(error, body, logger):
@@ -241,13 +268,8 @@ def handle_bolt_errors(error, body, logger):
 
 # ---------------------------------------------------------------------------
 # Event handler: any audio file posted in the Delegation channel
-#
-# NOTE: this runs fully synchronously (no lazy/background-thread split).
-# Vercel serverless kills background threads as soon as the HTTP response
-# is sent, so an earlier "ack now, process in a thread" pattern silently
-# lost work. Processing everything before responding keeps the whole run
-# inside one request lifecycle, which Vercel guarantees stays alive up to
-# maxDuration (300s here).
+# Runs fully synchronously so Vercel keeps the invocation alive for the
+# whole pipeline (up to maxDuration 300s).
 # ---------------------------------------------------------------------------
 @slack_app.event("message")
 def handle_message_events(event, say, logger):
@@ -317,9 +339,6 @@ def handle_message_events(event, say, logger):
 # ---------------------------------------------------------------------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    # Slack retries delivery (X-Slack-Retry-Num header set) if it doesn't get
-    # a response within 3s. Since we process synchronously and this can take
-    # 45-90s, just ack retries immediately without reprocessing.
     retry_num = request.headers.get("X-Slack-Retry-Num")
     try:
         body = request.get_json(silent=True) or {}
