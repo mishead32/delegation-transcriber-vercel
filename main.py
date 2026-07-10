@@ -8,6 +8,14 @@ Runs on Vercel Functions (Fluid Compute gives the Hobby/free plan up to
 Difference from the Render version: Vercel's Python runtime has no ffmpeg
 available, so this sends Slack's original audio file straight to Gemini
 (no format normalization, no duration lookup).
+
+Serverless-critical details (do not undo):
+- App(process_before_response=True): on Vercel, background threads are frozen
+  the instant the HTTP response is sent. Bolt's default ack-first behavior
+  therefore silently killed the files.slack.com download. Everything must run
+  before the response.
+- /slack/events drops Slack's automatic retries (X-Slack-Retry-Num header),
+  otherwise the >3s ack time would cause duplicate processing.
 """
 
 import os
@@ -19,6 +27,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 import gspread
@@ -39,6 +48,10 @@ logger = logging.getLogger("delegation-transcriber")
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 DELEGATION_CHANNEL_ID = os.environ["DELEGATION_CHANNEL_ID"]
+
+# Vercel servers run in UTC. Voice notes say things like "kal"/"tomorrow",
+# so resolve the reference date in YOUR timezone, not the server's.
+LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE", "Asia/Karachi")
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -94,7 +107,18 @@ GOOGLE_SCOPES = [
 # ---------------------------------------------------------------------------
 # Clients
 # ---------------------------------------------------------------------------
-slack_app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
+# process_before_response=True is REQUIRED on Vercel (and any serverless/FaaS
+# runtime). Without it, Bolt returns the HTTP 200 ack to Slack immediately and
+# runs listeners in a background thread -- but Vercel FREEZES the execution
+# environment the moment the response is sent, suspending that thread silently
+# in the middle of the files.slack.com download (no exception, no log). With
+# this flag, the whole listener runs BEFORE the response is returned, so the
+# invocation stays alive for the full pipeline (covered by maxDuration=300).
+slack_app = App(
+    token=SLACK_BOT_TOKEN,
+    signing_secret=SLACK_SIGNING_SECRET,
+    process_before_response=True,
+)
 handler = SlackRequestHandler(slack_app)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 google_creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON), scopes=GOOGLE_SCOPES)
@@ -106,21 +130,28 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # Google Sheets helper
 # ---------------------------------------------------------------------------
+_sheet = None
+
+
 def get_sheet():
+    # Lazy + cached: doing this at module import time means a Google Sheets
+    # network call on every cold start, and an import-time crash (HTTP 500 to
+    # Slack) if Sheets is momentarily unreachable. Fetch on first use instead.
+    global _sheet
+    if _sheet is not None:
+        return _sheet
     client = gspread.authorize(google_creds)
     sh = client.open_by_key(GOOGLE_SHEET_ID)
     try:
-        return sh.worksheet(GOOGLE_SHEET_TAB)
+        _sheet = sh.worksheet(GOOGLE_SHEET_TAB)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=GOOGLE_SHEET_TAB, rows=1000, cols=10)
         ws.append_row([
             "Timestamp", "Sent By", "Channel", "Transcript", "Slack Link", "Audio Length (s)",
             "Task", "Doer(s)", "Planned Date/Time", "Audio File Link",
         ])
-        return ws
-
-
-sheet = get_sheet()
+        _sheet = ws
+    return _sheet
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +345,7 @@ def handle_message_events(event, say, logger):
                 local_path = download_slack_file(f)
                 logger.info("Downloaded file to %s", local_path)
 
-                message_dt = datetime.fromtimestamp(float(event["ts"]))
+                message_dt = datetime.fromtimestamp(float(event["ts"]), tz=ZoneInfo(LOCAL_TIMEZONE))
                 result = analyze_audio(local_path, message_dt)
                 logger.info("Gemini analysis complete.")
 
@@ -322,7 +353,7 @@ def handle_message_events(event, say, logger):
                 permalink = get_permalink(event["channel"], event["ts"])
                 timestamp = message_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-                sheet.append_row([
+                get_sheet().append_row([
                     timestamp,
                     user_name,
                     event["channel"],
@@ -356,8 +387,13 @@ def slack_events():
     # handler.handle(request) -- consuming the body first breaks Bolt's own
     # ability to read it afterward in this environment, causing it to silently
     # fail to dispatch to any listener while still returning 200.
+    # With process_before_response=True the original request takes 45-90s, so
+    # Slack's 3-second ack deadline WILL be exceeded and Slack WILL send
+    # retries while the original invocation is still working. Dropping retries
+    # here is what prevents duplicate transcriptions/sheet rows -- do not
+    # remove this check. X-Slack-No-Retry asks Slack to stop retrying sooner.
     if request.headers.get("X-Slack-Retry-Num"):
-        return "", 200
+        return "", 200, {"X-Slack-No-Retry": "1"}
     return handler.handle(request)
 
 
