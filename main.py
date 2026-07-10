@@ -13,6 +13,7 @@ available, so this sends Slack's original audio file straight to Gemini
 import os
 import json
 import logging
+import ssl
 import tempfile
 import time
 import urllib.request
@@ -125,59 +126,71 @@ sheet = get_sheet()
 # ---------------------------------------------------------------------------
 # Slack + audio helpers
 # ---------------------------------------------------------------------------
+def _save_bytes(data, suffix):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(data)
+    tmp.close()
+    return tmp.name
+
+
 def download_slack_file(file_info):
     url = file_info["url_private_download"]
     logger.info("download_slack_file: starting, url=%s", url)
 
     suffix = os.path.splitext(file_info.get("name", "audio.m4a"))[1].lower() or ".m4a"
-    max_attempts = 4
+    auth_headers = {
+        "Authorization": "Bearer " + SLACK_BOT_TOKEN,
+        "User-Agent": "Mozilla/5.0 (compatible; DelegationTranscriber/1.0)",
+    }
+
+    max_attempts = 3
     attempt = 1
     last_error = None
 
     while attempt <= max_attempts:
-        logger.info("download_slack_file: attempt %s/%s (urllib)", attempt, max_attempts)
+        # Method 1: urllib with default SSL context
+        logger.info("download_slack_file: attempt %s/%s (urllib, default TLS)", attempt, max_attempts)
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "Authorization": "Bearer " + SLACK_BOT_TOKEN,
-                    "User-Agent": "Mozilla/5.0 (compatible; DelegationTranscriber/1.0)",
-                },
-            )
-            response = urllib.request.urlopen(req, timeout=60)
+            req = urllib.request.Request(url, headers=auth_headers)
+            response = urllib.request.urlopen(req, timeout=15)
             data = response.read()
             response.close()
-            logger.info("download_slack_file: urllib succeeded, %s bytes", len(data))
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.write(data)
-            tmp.close()
-            return tmp.name
+            logger.info("download_slack_file: urllib (default TLS) succeeded, %s bytes", len(data))
+            return _save_bytes(data, suffix)
         except Exception as e:
             last_error = e
-            logger.warning("download_slack_file: urllib attempt %s failed: %s", attempt, repr(e))
+            logger.warning("download_slack_file: urllib (default TLS) attempt %s failed: %s", attempt, repr(e))
 
+        # Method 2: urllib forcing TLS 1.2 explicitly (in case the CDN drops
+        # the connection during a TLS 1.3 handshake specifically).
+        logger.info("download_slack_file: attempt %s/%s (urllib, forced TLS 1.2)", attempt, max_attempts)
         try:
-            logger.info("download_slack_file: attempt %s/%s (requests fallback)", attempt, max_attempts)
-            resp = requests.get(
-                url,
-                headers={
-                    "Authorization": "Bearer " + SLACK_BOT_TOKEN,
-                    "User-Agent": "Mozilla/5.0 (compatible; DelegationTranscriber/1.0)",
-                },
-                timeout=60,
-            )
+            ctx = ssl.create_default_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+            req = urllib.request.Request(url, headers=auth_headers)
+            response = urllib.request.urlopen(req, timeout=15, context=ctx)
+            data = response.read()
+            response.close()
+            logger.info("download_slack_file: urllib (TLS 1.2) succeeded, %s bytes", len(data))
+            return _save_bytes(data, suffix)
+        except Exception as e:
+            last_error = e
+            logger.warning("download_slack_file: urllib (TLS 1.2) attempt %s failed: %s", attempt, repr(e))
+
+        # Method 3: requests library fallback.
+        logger.info("download_slack_file: attempt %s/%s (requests fallback)", attempt, max_attempts)
+        try:
+            resp = requests.get(url, headers=auth_headers, timeout=15)
             resp.raise_for_status()
             logger.info("download_slack_file: requests succeeded, %s bytes", len(resp.content))
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.write(resp.content)
-            tmp.close()
-            return tmp.name
+            return _save_bytes(resp.content, suffix)
         except Exception as e:
             last_error = e
             logger.warning("download_slack_file: requests attempt %s failed: %s", attempt, repr(e))
 
         if attempt == max_attempts:
-            logger.error("download_slack_file: all %s attempts failed", max_attempts)
+            logger.error("download_slack_file: all %s attempts (x3 methods each) failed", max_attempts)
             raise last_error
 
         wait = 3 * attempt
