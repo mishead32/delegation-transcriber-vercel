@@ -339,17 +339,11 @@ def handle_message_events(event, say, logger):
 # ---------------------------------------------------------------------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    retry_num = request.headers.get("X-Slack-Retry-Num")
-    try:
-        body = request.get_json(silent=True) or {}
-        logger.info(
-            "Incoming /slack/events: retry_num=%s type=%s event_type=%s",
-            retry_num, body.get("type"), (body.get("event") or {}).get("type"),
-        )
-    except Exception:
-        logger.exception("Failed to log incoming request body")
-
-    if retry_num:
+    # NOTE: do NOT read request.get_json()/request.data here before calling
+    # handler.handle(request) -- consuming the body first breaks Bolt's own
+    # ability to read it afterward in this environment, causing it to silently
+    # fail to dispatch to any listener while still returning 200.
+    if request.headers.get("X-Slack-Retry-Num"):
         return "", 200
     return handler.handle(request)
 
