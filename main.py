@@ -1,17 +1,13 @@
 """
-Delegation Voice-Note Transcriber — Vercel version
+Delegation Voice-Note Transcriber - Vercel version
 ----------------------------------------------------
 Runs on Vercel Functions (Fluid Compute gives the Hobby/free plan up to
-300 seconds per request by default — plenty of headroom for Gemini's
+300 seconds per request by default -- plenty of headroom for Gemini's
 ~45-90s audio calls).
 
 Difference from the Render version: Vercel's Python runtime has no ffmpeg
 available, so this sends Slack's original audio file straight to Gemini
-(no format normalization, no duration lookup). This works for the large
-majority of Slack voice notes (.m4a), but if Gemini ever rejects a
-particular file's format, that one upload will fail. If you see repeated
-failures, the Render version (which uses ffmpeg to normalize everything
-to mp3 first) is the more reliable fallback.
+(no format normalization, no duration lookup).
 """
 
 import os
@@ -35,7 +31,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("delegation-transcriber")
 
 # ---------------------------------------------------------------------------
-# Config (all pulled from environment variables — set these in Vercel's
+# Config (all pulled from environment variables -- set these in Vercel's
 # Project Settings > Environment Variables)
 # ---------------------------------------------------------------------------
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
@@ -43,7 +39,7 @@ SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 DELEGATION_CHANNEL_ID = os.environ["DELEGATION_CHANNEL_ID"]
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 ANALYSIS_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
@@ -76,7 +72,7 @@ ANALYSIS_SCHEMA = types.Schema(
 
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_SHEET_TAB = os.environ.get("GOOGLE_SHEET_TAB", "Delegation Log")
-GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]  # full service-account JSON, one line
+GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
 AUDIO_SUBTYPES = {"audio", "m4a", "mp3", "mp4", "wav", "ogg", "webm", "aac"}
 MIME_OVERRIDES = {
@@ -101,7 +97,7 @@ handler = SlackRequestHandler(slack_app)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 google_creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON), scopes=GOOGLE_SCOPES)
 
-# IMPORTANT: Vercel looks for a Flask instance named exactly "app" — do not rename.
+# IMPORTANT: Vercel looks for a Flask instance named exactly "app" -- do not rename.
 app = Flask(__name__)
 
 
@@ -128,9 +124,9 @@ sheet = get_sheet()
 # ---------------------------------------------------------------------------
 # Slack + audio helpers
 # ---------------------------------------------------------------------------
-def download_slack_file(file_info: dict) -> str:
+def download_slack_file(file_info):
     url = file_info["url_private_download"]
-    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    headers = {"Authorization": "Bearer " + SLACK_BOT_TOKEN}
     resp = requests.get(url, headers=headers, timeout=60)
     resp.raise_for_status()
     suffix = os.path.splitext(file_info.get("name", "audio.m4a"))[1].lower() or ".m4a"
@@ -140,13 +136,13 @@ def download_slack_file(file_info: dict) -> str:
     return tmp.name
 
 
-def analyze_audio(local_path: str, reference_dt: datetime) -> dict:
+def analyze_audio(local_path, reference_dt):
     """Transcribes the audio AND extracts task / doer(s) / planned date-time in one Gemini call."""
     reference_str = reference_dt.strftime("%A, %d %B %Y")
     prompt = (
         "This is a voice note from a workplace delegation/task-assignment Slack channel. "
         "The speaker may use Urdu, Hindi, or English, or a mix of these.\n\n"
-        f"The reference date for this message is: {reference_str}.\n\n"
+        "The reference date for this message is: " + reference_str + ".\n\n"
         "Listen to the audio and return a JSON object with these fields:\n"
         "1. transcript - exact word-for-word transcript in the original spoken language/script. "
         "No translation, no commentary.\n"
@@ -167,7 +163,8 @@ def analyze_audio(local_path: str, reference_dt: datetime) -> dict:
 
     max_attempts = 4
     response = None
-    for attempt in range(1, max_attempts + 1):
+    attempt = 1
+    while attempt <= max_attempts:
         try:
             response = genai_client.models.generate_content(
                 model=GEMINI_MODEL,
@@ -182,11 +179,9 @@ def analyze_audio(local_path: str, reference_dt: datetime) -> dict:
             if attempt == max_attempts:
                 raise
             wait = 10 * attempt
-            logger.warning(
-                "Gemini overloaded (attempt %s/%s), retrying in %ss: %s",
-                attempt, max_attempts, wait, e,
-            )
+            logger.warning("Gemini overloaded (attempt %s/%s), retrying in %ss: %s", attempt, max_attempts, wait, e)
             time.sleep(wait)
+            attempt = attempt + 1
 
     data = json.loads(response.text)
     return {
@@ -197,7 +192,7 @@ def analyze_audio(local_path: str, reference_dt: datetime) -> dict:
     }
 
 
-def get_user_name(user_id: str) -> str:
+def get_user_name(user_id):
     try:
         info = slack_app.client.users_info(user=user_id)
         u = info["user"]
@@ -206,7 +201,7 @@ def get_user_name(user_id: str) -> str:
         return user_id
 
 
-def get_permalink(channel: str, ts: str) -> str:
+def get_permalink(channel, ts):
     try:
         r = slack_app.client.chat_getPermalink(channel=channel, message_ts=ts)
         return r["permalink"]
@@ -215,79 +210,85 @@ def get_permalink(channel: str, ts: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Bolt-level error handler -- catches exceptions Bolt intercepts before/after
+# dispatching to our listener, so nothing fails completely silently.
+# ---------------------------------------------------------------------------
+@slack_app.error
+def handle_bolt_errors(error, body, logger):
+    logger.exception("Bolt-level error handling event: " + str(error))
+
+
+# ---------------------------------------------------------------------------
 # Event handler: any audio file posted in the Delegation channel
 #
 # NOTE: this runs fully synchronously (no lazy/background-thread split).
 # Vercel serverless kills background threads as soon as the HTTP response
-# is sent, so the earlier "ack now, process in a thread" pattern silently
-# lost work partway through once Drive upload was added (longer runtime).
-# Processing everything before responding keeps the whole run inside one
-# request lifecycle, which Vercel guarantees stays alive up to maxDuration
-# (300s here) — comfortably above the ~45-90s this pipeline takes.
-#
-# Slack will still fire an internal retry if it doesn't see a response
-# within 3s, but that retry is short-circuited in the /slack/events route
-# below (via the X-Slack-Retry-Num header) so we never double-process the
-# same voice note.
+# is sent, so an earlier "ack now, process in a thread" pattern silently
+# lost work. Processing everything before responding keeps the whole run
+# inside one request lifecycle, which Vercel guarantees stays alive up to
+# maxDuration (300s here).
 # ---------------------------------------------------------------------------
 @slack_app.event("message")
 def handle_message_events(event, say, logger):
-    logger.info(
-        "Received message event: channel=%s (expecting %s) has_files=%s",
-        event.get("channel"), DELEGATION_CHANNEL_ID, bool(event.get("files")),
-    )
-    if event.get("channel") != DELEGATION_CHANNEL_ID:
-        return
-    if event.get("subtype") == "message_changed":
-        return
-
-    files = event.get("files", [])
-    if not files:
-        return
-
-    for f in files:
-        mimetype = f.get("mimetype", "")
-        filetype = f.get("filetype", "")
+    try:
         logger.info(
-            "File in message: name=%s mimetype=%s filetype=%s",
-            f.get("name"), mimetype, filetype,
+            "Received message event: channel=%s (expecting %s) has_files=%s subtype=%s",
+            event.get("channel"), DELEGATION_CHANNEL_ID, bool(event.get("files")), event.get("subtype"),
         )
-        if not (mimetype.startswith("audio/") or filetype in AUDIO_SUBTYPES):
-            logger.info("Skipping file — not recognized as audio.")
-            continue
+        if event.get("channel") != DELEGATION_CHANNEL_ID:
+            return
+        if event.get("subtype") == "message_changed":
+            return
 
-        logger.info("New audio file detected: %s", f.get("name"))
-        local_path = None
-        try:
-            local_path = download_slack_file(f)
+        files = event.get("files", [])
+        if not files:
+            return
 
-            message_dt = datetime.fromtimestamp(float(event["ts"]))
-            result = analyze_audio(local_path, message_dt)
+        for f in files:
+            mimetype = f.get("mimetype", "")
+            filetype = f.get("filetype", "")
+            logger.info("File in message: name=%s mimetype=%s filetype=%s", f.get("name"), mimetype, filetype)
+            if not (mimetype.startswith("audio/") or filetype in AUDIO_SUBTYPES):
+                logger.info("Skipping file -- not recognized as audio.")
+                continue
 
-            user_name = get_user_name(event.get("user", ""))
-            permalink = get_permalink(event["channel"], event["ts"])
-            timestamp = message_dt.strftime("%Y-%m-%d %H:%M:%S")
+            logger.info("New audio file detected: %s", f.get("name"))
+            local_path = None
+            try:
+                local_path = download_slack_file(f)
+                logger.info("Downloaded file to %s", local_path)
 
-            sheet.append_row([
-                timestamp,
-                user_name,
-                event["channel"],
-                result["transcript"],
-                permalink,
-                "",  # audio length unavailable without ffmpeg on Vercel
-                result["task"],
-                result["doers"],
-                result["planned_date_time"],
-            ])
-            logger.info("Logged transcript + task info from %s to Google Sheet.", user_name)
+                message_dt = datetime.fromtimestamp(float(event["ts"]))
+                result = analyze_audio(local_path, message_dt)
+                logger.info("Gemini analysis complete.")
 
-            say(text="Transcribed and logged to the Delegation Sheet.", thread_ts=event["ts"])
-        except Exception as e:
-            logger.exception("Failed to process audio file")
-            say(text=f"Couldn't transcribe this audio: {e}", thread_ts=event["ts"])
-        finally:
-            if local_path and os.path.exists(local_path):
-                os.remove(local_path)
+                user_name = get_user_name(event.get("user", ""))
+                permalink = get_permalink(event["channel"], event["ts"])
+                timestamp = message_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+                sheet.append_row([
+                    timestamp,
+                    user_name,
+                    event["channel"],
+                    result["transcript"],
+                    permalink,
+                    "",
+                    result["task"],
+                    result["doers"],
+                    result["planned_date_time"],
+                ])
+                logger.info("Logged transcript + task info from %s to Google Sheet.", user_name)
+
+                say(text="Transcribed and logged to the Delegation Sheet.", thread_ts=event["ts"])
+            except Exception as e:
+                logger.exception("Failed to process audio file")
+                say(text="Couldn't transcribe this audio: " + str(e), thread_ts=event["ts"])
+            finally:
+                if local_path and os.path.exists(local_path):
+                    os.remove(local_path)
+    except BaseException:
+        logger.exception("Unhandled error in handle_message_events")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -297,9 +298,18 @@ def handle_message_events(event, say, logger):
 def slack_events():
     # Slack retries delivery (X-Slack-Retry-Num header set) if it doesn't get
     # a response within 3s. Since we process synchronously and this can take
-    # 45-90s, just ack retries immediately without reprocessing — otherwise
-    # a single voice note could get transcribed/logged multiple times.
-    if request.headers.get("X-Slack-Retry-Num"):
+    # 45-90s, just ack retries immediately without reprocessing.
+    retry_num = request.headers.get("X-Slack-Retry-Num")
+    try:
+        body = request.get_json(silent=True) or {}
+        logger.info(
+            "Incoming /slack/events: retry_num=%s type=%s event_type=%s",
+            retry_num, body.get("type"), (body.get("event") or {}).get("type"),
+        )
+    except Exception:
+        logger.exception("Failed to log incoming request body")
+
+    if retry_num:
         return "", 200
     return handler.handle(request)
 
