@@ -36,6 +36,7 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -96,6 +97,17 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 # not set, the Drive upload is skipped and the sheet's link column stays empty
 # -- the transcription pipeline is never affected.
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
+
+# Google no longer gives service accounts ANY Drive storage quota, so a
+# service-account upload into a My Drive folder fails with 403
+# storageQuotaExceeded even when the folder is shared with it. The fix is to
+# upload as the real user via OAuth. Generate these three values once with
+# get_drive_token.py (in this folder) and set them in Vercel. If they are not
+# set, the code falls back to the service account (works only for Shared
+# Drives on Google Workspace).
+GDRIVE_OAUTH_CLIENT_ID = os.environ.get("GDRIVE_OAUTH_CLIENT_ID", "").strip()
+GDRIVE_OAUTH_CLIENT_SECRET = os.environ.get("GDRIVE_OAUTH_CLIENT_SECRET", "").strip()
+GDRIVE_OAUTH_REFRESH_TOKEN = os.environ.get("GDRIVE_OAUTH_REFRESH_TOKEN", "").strip()
 
 AUDIO_SUBTYPES = {"audio", "m4a", "mp3", "mp4", "wav", "ogg", "webm", "aac"}
 MIME_OVERRIDES = {
@@ -167,21 +179,48 @@ def get_sheet():
 # Google Drive helper (fail-soft: any problem here returns "" and the main
 # transcription pipeline continues untouched)
 # ---------------------------------------------------------------------------
+_drive_user_creds = None
+
+
+def _get_drive_access_token():
+    """Access token for Drive uploads. Prefers the user's OAuth credentials
+    (files get owned by YOU and use YOUR storage quota); falls back to the
+    service account, which only works for Shared Drives."""
+    global _drive_user_creds
+    if GDRIVE_OAUTH_CLIENT_ID and GDRIVE_OAUTH_CLIENT_SECRET and GDRIVE_OAUTH_REFRESH_TOKEN:
+        if _drive_user_creds is None:
+            _drive_user_creds = UserCredentials(
+                token=None,
+                refresh_token=GDRIVE_OAUTH_REFRESH_TOKEN,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=GDRIVE_OAUTH_CLIENT_ID,
+                client_secret=GDRIVE_OAUTH_CLIENT_SECRET,
+                scopes=["https://www.googleapis.com/auth/drive"],
+            )
+        if not _drive_user_creds.valid:
+            _drive_user_creds.refresh(GoogleAuthRequest())
+        return _drive_user_creds.token
+    logger.warning(
+        "upload_audio_to_drive: GDRIVE_OAUTH_* env vars not set -- falling back "
+        "to the service account, which CANNOT upload to My Drive folders "
+        "(no storage quota). Run get_drive_token.py and set the env vars."
+    )
+    if not google_creds.valid:
+        google_creds.refresh(GoogleAuthRequest())
+    return google_creds.token
+
+
 def upload_audio_to_drive(local_path, original_name, message_dt):
-    """Uploads the audio to the shared Drive folder, makes it link-viewable,
+    """Uploads the audio to the Drive folder, makes it link-viewable,
     and returns the webViewLink. Returns "" on any failure or if not configured.
 
-    Uses the Drive v3 REST API directly with the existing service-account
-    credentials, so no new pip dependencies are needed.
+    Uses the Drive v3 REST API directly, so no new pip dependencies are needed.
     """
     if not GDRIVE_FOLDER_ID:
         logger.info("upload_audio_to_drive: GDRIVE_FOLDER_ID not set, skipping upload.")
         return ""
     try:
-        # Refresh the service-account token (shared with the Sheets client).
-        if not google_creds.valid:
-            google_creds.refresh(GoogleAuthRequest())
-        token = google_creds.token
+        token = _get_drive_access_token()
 
         safe_name = original_name or "voice_note.m4a"
         drive_name = message_dt.strftime("%Y-%m-%d_%H-%M-%S") + "_" + safe_name
@@ -228,7 +267,16 @@ def upload_audio_to_drive(local_path, original_name, message_dt):
 
         return link
     except Exception as e:
-        logger.warning("upload_audio_to_drive: upload failed (continuing without link): %s", repr(e))
+        # Include the API's response body -- Google's 403s carry the real
+        # reason (e.g. storageQuotaExceeded, accessNotConfigured) there.
+        detail = ""
+        err_resp = getattr(e, "response", None)
+        if err_resp is not None:
+            try:
+                detail = " | body: " + err_resp.text[:500]
+            except Exception:
+                pass
+        logger.warning("upload_audio_to_drive: upload failed (continuing without link): %s%s", repr(e), detail)
         return ""
 
 
@@ -447,8 +495,6 @@ def handle_message_events(event, say, logger):
                     audio_link,
                 ])
                 logger.info("Logged transcript + task info from %s to Google Sheet.", user_name)
-
-                say(text="Transcribed and logged to the Delegation Sheet.", thread_ts=event["ts"])
             except Exception as e:
                 logger.exception("Failed to process audio file")
                 say(text="Couldn't transcribe this audio: " + str(e), thread_ts=event["ts"])
